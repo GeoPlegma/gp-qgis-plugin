@@ -1,6 +1,8 @@
 import json
 import os
-from qgis.PyQt.QtWidgets import QAction, QFileDialog, QInputDialog, QMessageBox
+import threading
+import time
+from qgis.PyQt.QtWidgets import QAction, QFileDialog, QInputDialog, QMessageBox, QProgressDialog, QApplication
 from qgis.PyQt.QtGui import QIcon
 from qgis.core import (
     QgsVectorLayer,
@@ -10,7 +12,7 @@ from qgis.core import (
     QgsField,
     QgsPointXY
 )
-from qgis.PyQt.QtCore import QVariant
+from qgis.PyQt.QtCore import QVariant, Qt
 
 try:
     from . import geoplegma_py
@@ -78,8 +80,35 @@ class GeoPlegmaPlugin:
             level = int(selected_level_str)
             
             self.iface.mainWindow().statusBar().showMessage("Loading GeoPlegma data...")
-            json_data = store.export_level(level)
-            cells = json.loads(json_data)
+            
+            progress = QProgressDialog("Extracting and parsing data...", "Cancel", 0, 0, self.iface.mainWindow())
+            progress.setWindowTitle("Loading GeoPlegma Data")
+            progress.setMinimumDuration(0)
+            progress.show()
+            
+            result_container = {}
+            def load_data_thread():
+                try:
+                    j_data = store.export_level(level)
+                    result_container['cells'] = json.loads(j_data)
+                except Exception as e:
+                    result_container['exception'] = e
+                    
+            thread = threading.Thread(target=load_data_thread)
+            thread.start()
+            
+            while thread.is_alive():
+                QApplication.processEvents()
+                if progress.wasCanceled():
+                    return
+                time.sleep(0.05)
+                
+            progress.cancel()
+            
+            if 'exception' in result_container:
+                raise result_container['exception']
+                
+            cells = result_container.get('cells', [])
             
             if not cells:
                 QMessageBox.information(self.iface.mainWindow(), "Info", "No data found for this level.")
@@ -112,7 +141,18 @@ class GeoPlegmaPlugin:
         layer.updateFields()
 
         features = []
-        for cell in cells:
+        total_cells = len(cells)
+        progress = QProgressDialog("Creating features...", "Cancel", 0, total_cells, self.iface.mainWindow())
+        progress.setWindowTitle("Loading GeoPlegma Data")
+        progress.setMinimumDuration(0)
+
+        for i, cell in enumerate(cells):
+            if progress.wasCanceled():
+                break
+                
+            if i % 100 == 0:
+                progress.setValue(i)
+                
             feat = QgsFeature(layer.fields())
             
             polygon_coords = cell.get("polygon", [])
@@ -127,6 +167,10 @@ class GeoPlegmaPlugin:
                 feat.setAttribute(band, cell.get(band))
 
             features.append(feat)
+
+        progress.setValue(total_cells)
+        if progress.wasCanceled():
+            return
 
         provider.addFeatures(features)
         layer.updateExtents()
